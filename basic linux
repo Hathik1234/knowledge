@@ -1,1974 +1,360 @@
-#!/bin/ksh
-
-# +-------------------------------------------------------------------------------------------------------+
-# ID             : ProcessSDTMExtraction.ksh
-# NAME           : ProcessSDTMExtraction.ksh
-# PURPOSE        : ProcessSDTMExtraction.ksh used to process study data extraction request from CDL-SDTM into CPI
-# ENVIRONMENT    : Linux
-# PROJECT        : CDL-SDTM Extraction into CPI
-# AREA           : AnR / Firewalled 
-# +--------------------- Revision Record -----------------------------------------------------------------+
-# Version       Date             Author              Description
-# 1.0	        03/07/2025	     Chetan Holi      Initial Version for CPI 6.0 Release
-# +-------------------------------------------------------------------------------------------------------+
-
-#-------------------------------------
-# Update the below during deployment
-#-------------------------------------
-
-user_dir="/opt/bardsardev/shared-area"
-ORACLE_SERVER_SCP="bardscpi@lctcvd1538.merck.com"
-
-#-------------------------------------
-
-param_count=1
-tns_alias=${1}
-
-HOME=/opt/bardscpi
-. $HOME/.profile
-. /opt/bardscpi/bin/Set_vars $tns_alias 
-
-BARDSCPIDIRECTORY="${BARDSCPI}"
-if [[ "X${BARDSCPIDIRECTORY}" = "X" ]]
-then
-        echo "Please set directory path"
-        exit 1
-fi
-
-error_log="${BARDSCPIDIRECTORY}/logs/ProcessSDTMExtraction.log"
-
-echo "================================= NEW RUN =========================" >> "${error_log}"
-echo `date` >> "${error_log}"
+from databricks import sql
+import argparse
+import yaml
+import logging
+import os
+import sys
+from pathlib import Path
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+import subprocess
+import cx_Oracle
+import json
 
 
+def load_and_validate_yaml(yaml_path):
 
-function raise_error {
-        flag=1
-         error_count=$(expr ${error_count} + 1)
-                 echo "error encountered"
-         if [[ "$1" = "reject" ]]
-         then
-               #Remove_temporary_files 2>/dev/null
+    """ Load Configuration data from YAML file
+        Returns: Dictionary - if success """
+    try:
+        if not os.path.isfile(yaml_path):
+            raise FileNotFoundError(f"ERROR - The YAML file '{yaml_path}' does not exist.")
 
-               echo "Failure BARDSCPI - CDL-SDTM Extraction error while processing" >>"${error_log}"
-                       exit 1
-                 elif [[ "$1" = "tnsinvalid" ]]
-                 then
-                           echo "Failure BARDSCPI CDL-SDTM Data extraction: The Oracle TNS Alias [$tns_alias] does not exist " >>"${error_log}"
-                       exit 1
-                 elif [[ "$1" = "user_request" ]]
-                 then
-               echo "Failure BARDSCPI CDL-SDTM Data extraction: The user_request folder [$user_request] does not exist " >>"${error_log}"
-                       exit 1
-         else
-               echo "BARDSCPI CDL-SDTM Data Extraction request creation failed " | mailx -s "Failure BARDSCPI CDL-SDTM Data Extraction request" >>"${error_log}"
+        with open(yaml_path, "r") as yaml_file:
+            data = yaml.safe_load(yaml_file)
 
-         fi
-}
+        if not data:
+            raise ValueError("ERROR - The study specific YAML configuration file is empty.")
+        return data
+    except (yaml.YAMLError, ValueError, FileNotFoundError) as e:
+       raise ValueError(f"ERROR - YAML validation failed - {e}")
 
+def update_audit_log_table(session, status, msg, audit_log_sq_no):
+    """
+    Update the audit log table with the provided status and message.
+    """
+    try:
+        logging.info("Updating Audit Log table with FAIL status and Error msg")
+        audit_sql = text("""UPDATE BARDSCPI.SDTM_AUDIT_LOG SET STATUS_CD = :status, STATUS_MSG = :msg WHERE AUDIT_LOG_SEQ_NO = :seq_no""")
+        session.execute(audit_sql, {
+            "status": status,
+            "msg": str(msg),
+            "seq_no": int(audit_log_sq_no)
+        })
+        session.commit()
+    except Exception as e:
+        # roll back stmnt
+        logging.error(f"Error while updating Audit Log Table with Fail Status: {e}")
+        raise
 
-###############################################
-#Check tns_alias by doing tnsping
-###############################################
-tnsping "${tns_alias}" >/dev/null 2>&1 || { echo "tns alias is not valid">>"${error_log}"; raise_error "tnsinvalid"; } 
+def establish_databricks_connection(config, session, audit_log_sq_no, logfile_path, oracle_server_scp):
 
-error_count=0
-
-###########################################################################################################################################
-# RECORD FIELDS: PARAM FILE TO TABLE MAPPING
-###########################################################################################################################################
-
-not_fromfile_string="AUDIT_LOG_SEQ_NO||':'||STATUS_CD||':'||STATUS_MSG||':'||CREATE_TIME\
-||':'||START_TIME||':'||END_TIME||':'||"
-
-fields_audit_log="TARGET_LOCATION||':'||STUDY_ID||':'||STUDY_SCHEMA||':'||COMP_INDICATION||':'||\
-PROTOCOL_DELPKG ||':'||LIFE_CYCLE||':'||MASKED_BLINDED||':'||ACTIVE||':'||\
-EMAIL_ADDRESS||':'||PLATFORM||':'||BUSINESS_GROUP||':'||USER_ISID"
-
-
-fields_auth_master="TARGET_LOCATION||':'||COMP_INDICATION||':'||\
-PROTOCOL_DELPKG||':'||LIFE_CYCLE||':'||MASKED_BLINDED||':'||AUTH_ISID"
-
-###########################################################################################################################################
-
-# Path to be used by Python programs
-tmp_output_dir="${BARDSCPIDIRECTORY}/tmp_output_dir_sdtm"
-#sub_dir="sdtm"
-
-#path used by shell script
-list_of_files="${tmp_output_dir}/sdtm_listoffiles.tmp"  
-file_search_list="${tmp_output_dir}/*.txt"
-config_file_processed="${tmp_output_dir}/sdtm_config_file.tmp"
-
-InsertScriptLog="${tmp_output_dir}/sdtm_insertScript.log"
-auth_master="${tmp_output_dir}/sdtm_auth_master.dat"
-audit_log="${tmp_output_dir}/sdtm_audit_log.dat"
-
-calljava="${tmp_output_dir}/sdtm_calljava.dat"
-
-java_log="${BARDSCPIDIRECTORY}/log/ProcessSDTMExtractionJava.log"
-
-#####################################################
-#    Oracle variables and connectivity strings setup
-#####################################################
-
-log_level='DEBUG'
-db_user_name='bardscpi'
-db_password=$(getpass ${db_user_name})
-
-connectstring="$db_user_name/$db_password@${tns_alias}"
-insert_script="${tmp_output_dir}/sdtm_insert_script.sql"
-ora_sequence_name="sdtm_audit_log_SEQ.NEXTVAL"
-
-
-host_name=$(tnsping "${tns_alias}" |tr -d ' '|tr ')' '\n'|tr '(' '\n' |grep "HOST=" |head -n1|cut -d"=" -f2|tr '[:lower:]' '[:upper:]' )
-port_number=$(tnsping "${tns_alias}" |tr -d ' '|tr ')' '\n'|tr '(' '\n' |grep "PORT=" |head -n1|cut -d"=" -f2 )
-sid=$(tnsping "${tns_alias}" |tr -d ' '|tr ')' '\n'|tr '(' '\n' |grep "SID=" |head -n1|cut -d"=" -f2 )
-
-
-###########################################################################################################################################
-#  Function: CreateInsertScript
-#
-#  This function creates the INSERT SQL for recording the user request details from user parameter file into the sdtm_audit_log table.
-#  The SQL statement is recorded into a .SQL file.
-###########################################################################################################################################
-
-function CreateInsertScript
-{
-
- table_name="${1}"
- column_list=$(echo "${not_fromfile_string} $2" |sed -e 's/|//g' -e s/\'//g -e s/:/:/g)
- 
- rm -rf "${insert_script}" >/dev/null
- 
- while read insert_details #2>>"${error_log}"
- do 
-	    status_cd="NEW"
-        column_list_append=$(echo "${ora_sequence_name} :'${status_cd}':null: sysdate:null:null")
-
-        #insert into table clause
-    		echo "INSERT INTO ${table_name}  ( ${column_list} ) "|sed -e 's/|//g' -e s/\'//g -e 's/:/,/g' >>"${insert_script}"
-	
-        #echo "${column_list_append}:${insert_details}"
-        echo "${column_list_append}:${insert_details}" |awk -F':' '{print " VALUES ("$1 c $2 c $3 c $4 c $5\
-        c $6 c q$7q c q$8q c q$9q c q$10q c q$11q c q$12q c q$13q c q$14q c q$15q c q$16q c q$17q c q$18q\
-        ")" sc }' c="," q="'" sc=";" | sed -e "s/\'NULL\'/null/g" >>"${insert_script}"
+    """ Get the details from YAML to connect to Databricks
+        Returns: Connection string """
+    try:
+        logging.info("Establishing connection to databricks")
+        #Get databricks connectivity details from YAML
+        server_hostname = config['databricks_conn']['server_hostname']
+        https_path = config['databricks_conn']['https_path']
+        token = config['databricks_conn']['access_token']
     
- done < "${3}"
- echo "commit;">>"${insert_script}"
-}
+        # Connect to Databricks
+        connection = sql.connect(
+            server_hostname=server_hostname,
+            http_path=https_path,
+            access_token=token
+         )
 
-###########################################################################################################################################
-#  Function: SqlInfoGenerate
-#
-#  This function executes the .SQL file created by the CreateInsertScript function. 
-#  It loads the user request details from user parameter file into the sdtm_audit_log table. 
-###########################################################################################################################################
+        return connection
 
-function SqlInfoGenerate
-{
-	sql_file_select_tmp="${tmp_output_dir}/sdtm_tmp_sql_file.sql"
-	sql_string="${1}"
-	sql_file_select="${2}"
-	`sqlplus -s ${connectstring} << sqlhere
-	WHENEVER SQLERROR EXIT 5
-	WHENEVER OSERROR EXIT 10
-	set feedback off
-	set heading off
-	set define off
-	set linesize 1000
-	SPOOL ${sql_file_select_tmp}
-	${sql_string}
-	SPOOL OFF
-	EXIT;
-	sqlhere`
-	if [[ "X${2}" != "X" ]] 
-	then
-        sort "${sql_file_select_tmp}" | sed -e "s/ \{1,\}$//" -e '/^$/d' >"${sql_file_select}"
-        rm -f "${sql_file_select_tmp}"
-	fi
-        
-}
+    except Exception as e:
+        logging.error(f"Error while connecting to databricks: {e}")
+        zip_and_transfer(audit_log_sq_no, logfile_path, oracle_server_scp)
+        # Updating audit_log table
+        error_msg =  """<br>
+        <strong>ExtractCDLSDTMDataException:</strong> System encountered an error while connecting to CDL Databricks server.<br>
+        <strong>Error Cause:</strong> Connectivity error encountered.<br>
+		<strong>Next Steps:</strong> Submit a CPI request to report the issue."""
+        update_audit_log_table(session, 'FAIL', error_msg, audit_log_sq_no)
+        raise
 
-###########################################################################################################################################
-#  Function: validateData
-#
-#  This is the bulk validation logic.  The request submitted by user is cross-validated for user permissions from the sdtm_auth_master table.
-#  The CPI User Interface form should have most of the logic to prevent unauthorized extractions. But some validations are done here too 
-#  as a backup.
-###########################################################################################################################################
+def get_oracle_db_session(config):
 
-
-function validateData
-{
-set -x
- #this function gets USER PERMISSIONS authentication data from table and puts it into a file
-
-tmpcalljava="${tmp_output_dir}/sdtm_tmpcalljava.dat"
-sqlplus -s /nolog <<sqlhere >/dev/null
-connect ${connectstring}
-WHENEVER SQLERROR EXIT 5
-WHENEVER OSERROR EXIT 10
-set feedback off
-set heading off
-set define off
-set serverout on
-set linesize 1000
-SPOOL ${tmpcalljava}
-
-DECLARE
-   CURSOR cur_sdtm_audit_log_new (p_status_cd sdtm_audit_log.status_cd%TYPE)
-   IS
-      SELECT   *
-          FROM sdtm_audit_log al
-         WHERE al.status_cd = p_status_cd 
-      ORDER BY al.audit_log_seq_no;
+    """ Get the details from YAML to connect to Onprem oracle Database
+        Returns: Connection string """
     
-	
-   v_count_valid          NUMBER;
-   valid_cnt              NUMBER;
-   v_in_progress_cnt      NUMBER;
-   v_status               sdtm_audit_log.status_cd%TYPE;
-   v_status_msg           sdtm_audit_log.status_msg%TYPE;
-   v_unmatched_values     VARCHAR2 (4000) := NULL ;
-   v_max_count            NUMBER;
-   v_jdbc_host     	  VARCHAR2 (100) := '$host_name';
-   v_jdbc_port     	  VARCHAR2 (100) := '$port_number';
-   v_jdbc_sid     	  VARCHAR2 (100) := '$sid';
-   v_error_log            VARCHAR2 (400)                       := '$java_log';
-   v_call_python            VARCHAR2 (4000);
-   v_dup_count            NUMBER;
-   error_number           VARCHAR2 (5)                         := '0';
-   v_sas_output_dir       sdtm_auth_master.sas_output_dir%TYPE;
-   v_sub_dir       sdtm_auth_master.sub_dir%TYPE;
-   v_end_date             sdtm_audit_log.end_time%TYPE;
-   v_int_valid            NUMBER;
-   v_ins_detls            VARCHAR2 (400);
-   ex_general_exception   EXCEPTION;
-   ex_exception           EXCEPTION;
-   v_platform             VARCHAR2(1000);
-   v_dup_count_ta NUMBER; 
-
-BEGIN
-
-FOR audit_rec IN cur_sdtm_audit_log_new ('NEW')
-   LOOP
-
-	DECLARE
-		ex_exception EXCEPTION;
-	BEGIN
-            v_unmatched_values := NULL ;
-            
-            IF audit_rec.TARGET_LOCATION NOT IN ('TEST', 'PROD')
-            THEN
-                v_status_msg :=  '<br><br><font color="red">The value of parameters ENV = ' || upper(audit_rec.target_location)|| ' does not match what was requested for the CDL-SDTM extraction permissions. Please verify all the parameters in the extraction program must match with the extraction permission and resubmit the job.</font>';
-                v_status := 'REJECTED';
-                RAISE ex_exception;
-            END IF;
-
-            
-            -- to verify that the LIFE_CYCLE is PROD or PROD-PREVIEW 
-            IF audit_rec.LIFE_CYCLE NOT IN ('PROD', 'PROD-PREVIEW')
-            THEN
-                v_status_msg :=  '<br><br><font color="red">The value of parameters CDL_LIFE_CYCLE = ' || upper(audit_rec.life_cycle)|| ' does not match what was requested for the CDL-SDTM extraction permissions. Please verify all the parameters in the extraction program must match with the extraction permission and resubmit the job.</font>';
-                v_status := 'REJECTED';
-                RAISE ex_exception;
-            END IF;
-
-            -- to verify that the MASKED_BLINDED is MASKED & BLINDED or UNMASKED & BLINDED
-            IF audit_rec.MASKED_BLINDED NOT IN ('MASKED & BLINDED', 'UNMASKED & BLINDED')
-            THEN
-                v_status_msg :=  '<br><br><font color="red">The value of parameters MASKED_BLINDED = ' || upper(audit_rec.masked_blinded)|| ' does not match what was requested for the CDL-SDTM extraction permissions. Please verify all the parameters in the extraction program must match with the extraction permission and resubmit the job.</font>';
-                v_status := 'REJECTED';
-                RAISE ex_exception;
-            END IF;
-
-  -- Validate with AUTH MASTER recorded permissions -  START
-         v_platform := audit_rec.platform;
-         v_count_valid :=0;
-
-		 IF v_platform is Null THEN
-		 SELECT COUNT (1)
-		   INTO v_count_valid
-		   FROM sdtm_auth_master am
-		  WHERE audit_rec.user_isid = am.auth_isid
-		    AND audit_rec.study_id = UPPER (am.study_id)
-			AND audit_rec.study_schema = UPPER (am.study_schema)
-		    AND audit_rec.target_location = UPPER (am.target_location)
-		    AND audit_rec.protocol_delpkg = UPPER (am.protocol_delpkg)
-		    AND am.platform = 'ANR'
-		    AND audit_rec.comp_indication = UPPER (am.comp_indication)
-		    AND audit_rec.life_cycle = UPPER (am.life_cycle)
-		    AND audit_rec.masked_blinded = UPPER (am.masked_blinded) 
-			AND audit_rec.active = UPPER (am.active);
-
-	 ELSIF v_platform='FIREWALLED' THEN
-		 SELECT COUNT (1)
-		   INTO v_count_valid
-		   FROM sdtm_auth_master am
-		  WHERE audit_rec.user_isid = am.auth_isid
-		    AND audit_rec.study_id = UPPER (am.study_id)
-			AND audit_rec.study_schema = UPPER (am.study_schema)
-		    AND audit_rec.target_location = UPPER (am.target_location)
-		    AND audit_rec.protocol_delpkg = UPPER (am.protocol_delpkg)
-		    AND audit_rec.platform = am.platform
-		    AND audit_rec.business_group = UPPER (am.business_group)
-		    AND audit_rec.life_cycle = UPPER (am.life_cycle)
-		    AND audit_rec.masked_blinded = UPPER (am.masked_blinded) 
-			AND audit_rec.active = UPPER (am.active);		 
-	 END IF;
-   	 
-  -- Validate with AUTH MASTER recorded permissions -  END
-
-
-        error_number := 3;
-
-         IF v_count_valid > 0
-         THEN
-            v_status := 'WAIT';
-            v_status_msg := NULL;
-            v_end_date := NULL;
-
-	    IF v_platform is Null THEN
-		    SELECT sas_output_dir 
-		      INTO v_sas_output_dir 
-		      FROM sdtm_auth_master am
-		     WHERE audit_rec.user_isid = am.auth_isid
-		       AND audit_rec.study_id = UPPER (am.study_id)
-			   AND audit_rec.study_schema = UPPER (am.study_schema)
-		       AND audit_rec.target_location = UPPER (am.target_location)
-		       AND audit_rec.protocol_delpkg = UPPER (am.protocol_delpkg)
-		       AND am.platform = 'ANR'
-		       AND audit_rec.comp_indication = UPPER (am.comp_indication)
-		       AND audit_rec.life_cycle = UPPER (am.life_cycle)
-		       AND audit_rec.masked_blinded = UPPER (am.masked_blinded) 
-			   AND audit_rec.active = UPPER (am.active) 
-		       AND ROWNUM = 1;	    
-	    ELSIF v_platform='FIREWALLED' THEN
-		    SELECT sas_output_dir 
-		      INTO v_sas_output_dir 
-		      FROM sdtm_auth_master am
-		     WHERE audit_rec.user_isid = am.auth_isid
-		       AND audit_rec.study_id = UPPER (am.study_id)
-			   AND audit_rec.study_schema = UPPER (am.study_schema)
-		       AND audit_rec.target_location = UPPER (am.target_location)
-		       AND audit_rec.protocol_delpkg = UPPER (am.protocol_delpkg)
-		       AND audit_rec.platform = am.platform
-		       AND audit_rec.business_group = UPPER (am.business_group)
-		       AND audit_rec.life_cycle = UPPER (am.life_cycle)
-		       AND audit_rec.masked_blinded = UPPER (am.masked_blinded) 
-			   AND audit_rec.active = UPPER (am.active) 
-		       AND ROWNUM = 1;	    
-	    END IF;
-
-            IF v_sas_output_dir IS NULL
-            THEN
-               error_number := '6-1';
-               RAISE ex_general_exception;
-            END IF;
-
-            UPDATE sdtm_audit_log al
-               SET status_cd = v_status,
-                   status_msg = v_status_msg,
-                   sas_output_dir = v_sas_output_dir
-             WHERE al.audit_log_seq_no = audit_rec.audit_log_seq_no;
-
-            v_sas_output_dir := NULL;
-    	ELSE
-            v_status := 'REJECTED';
-            v_end_date := NULL;
-            v_sas_output_dir := NULL;
-
-            --to verify userid
-            SELECT COUNT (*)
-              INTO valid_cnt
-              FROM sdtm_auth_master am
-             WHERE audit_rec.user_isid = am.auth_isid;
-
-            IF valid_cnt = 0
-            THEN
-               v_status_msg :=
-                           'You do not have SDTM extractions permissions';
-               v_status := 'REJECTED';
-               RAISE ex_exception;
-            END IF;
-
-           /*------------------------------------------------------------------
-              THIRD LEVEL VALIDATION 
-           --------------------------------------------------------------------*/
-	
-	    IF v_platform is Null THEN
-		    -- to verify compound indication
-        /*----------------------------------------------------------
-                ANR - COMPOUND INDICATION
-        -----------------------------------------------------------*/
-		    SELECT COUNT (1)
-		      INTO valid_cnt
-		      FROM sdtm_auth_master am
-		     WHERE audit_rec.user_isid = am.auth_isid
-		       AND am.platform = 'ANR'
-		       AND audit_rec.comp_indication = UPPER (am.comp_indication);
-
-		    IF valid_cnt = 0
-		    THEN
-           v_unmatched_values := v_unmatched_values || ', compound_indication = '
-                                  || audit_rec.comp_indication;
-		       v_status := 'REJECTED';
-		       RAISE ex_exception;
-		    END IF;
-
-		    -- to verify protocol deliverable
-        /*----------------------------------------------------------
-                ANR - PROTOCOL DELPKG
-        -----------------------------------------------------------*/
-		    SELECT COUNT (1)
-		      INTO valid_cnt
-		      FROM sdtm_auth_master am
-		     WHERE audit_rec.user_isid = am.auth_isid
-		       AND am.platform = 'ANR'
-		       AND audit_rec.comp_indication = UPPER (am.comp_indication)
-		       AND audit_rec.protocol_delpkg = UPPER (am.protocol_delpkg);
-
-		    IF valid_cnt = 0
-		    THEN
-                v_unmatched_values := v_unmatched_values || ', PROTOCOL_DELPKG = '
-                                  || audit_rec.protocol_delpkg;
-		       v_status := 'REJECTED';
-		       RAISE ex_exception;
-		    END IF;
-
-
-        -- to verify life cycle
-        /*----------------------------------------------------------
-                ANR - LIFE_CYCLE
-        -----------------------------------------------------------*/
-        SELECT COUNT (1)
-          INTO valid_cnt
-          FROM sdtm_auth_master am
-         WHERE audit_rec.user_isid = am.auth_isid
-           --AND audit_rec.target_location = UPPER (am.target_location)
-           AND audit_rec.life_cycle = UPPER (am.life_cycle)
-           AND am.platform = 'ANR'
-           AND audit_rec.comp_indication = UPPER (am.comp_indication)
-           AND audit_rec.protocol_delpkg = UPPER (am.protocol_delpkg);
-
-        IF valid_cnt = 0
-        THEN
-           v_unmatched_values := v_unmatched_values || ', life_cycle = '
-                                  || audit_rec.life_cycle;
-           v_status := 'REJECTED';
-           RAISE ex_exception;
-        END IF;
-
-        -- to verify Environment
-        /*----------------------------------------------------------
-                ANR - TARGET LOCATION / ENVIRONMENT
-        -----------------------------------------------------------*/
-        SELECT COUNT (1)
-          INTO valid_cnt
-          FROM sdtm_auth_master am
-         WHERE audit_rec.user_isid = am.auth_isid
-           AND audit_rec.target_location = UPPER (am.target_location)
-           AND audit_rec.life_cycle = UPPER (am.life_cycle)
-           AND am.platform = 'ANR'
-           AND audit_rec.comp_indication = UPPER (am.comp_indication)
-           AND audit_rec.protocol_delpkg = UPPER (am.protocol_delpkg);
-
-        IF valid_cnt = 0
-        THEN
-           v_unmatched_values := v_unmatched_values || ', env = '
-                                  || audit_rec.target_location;
-           v_status := 'REJECTED';
-           RAISE ex_exception;
-        END IF;
-
-       
-         -- to verify MAKSED
-        /*----------------------------------------------------------
-                ANR - MASKED_BLINDED
-        -----------------------------------------------------------*/
-        SELECT COUNT (1)
-          INTO valid_cnt
-          FROM sdtm_auth_master am
-         WHERE audit_rec.user_isid = am.auth_isid
-           AND audit_rec.target_location = UPPER (am.target_location)
-           AND audit_rec.life_cycle = UPPER (am.life_cycle)
-           AND am.platform = 'ANR'
-           AND audit_rec.comp_indication = UPPER (am.comp_indication)
-           AND audit_rec.protocol_delpkg = UPPER (am.protocol_delpkg) 
-           AND audit_rec.masked_blinded = UPPER (am.masked_blinded);
-
-        IF valid_cnt = 0
-        THEN
-           v_unmatched_values := v_unmatched_values || ', masked_blinded = '
-                                  || audit_rec.masked_blinded;
-           v_status := 'REJECTED';
-           RAISE ex_exception;
-        END IF;
-
-    -- to verify study
-        /*----------------------------------------------------------
-                ANR - STUDY
-        -----------------------------------------------------------*/
-		    SELECT COUNT (1)
-		      INTO valid_cnt
-		      FROM sdtm_auth_master am
-		     WHERE audit_rec.user_isid = am.auth_isid
-		       AND audit_rec.target_location = UPPER (am.target_location)
-		       AND audit_rec.life_cycle = UPPER (am.life_cycle)
-		       AND am.platform = 'ANR'
-		       AND audit_rec.comp_indication = UPPER (am.comp_indication)
-		       AND audit_rec.protocol_delpkg = UPPER (am.protocol_delpkg)
-               AND audit_rec.masked_blinded = UPPER (am.masked_blinded)
-		       AND audit_rec.study_id = UPPER (am.study_id);
-
-		    IF valid_cnt = 0
-		    THEN
-
-				v_unmatched_values := v_unmatched_values || ', study = '
-                                  || audit_rec.study_id;
-				v_status := 'REJECTED';
-				RAISE ex_exception;
-		    END IF;
-
-
-    -- to verify study schema
-        /*----------------------------------------------------------
-                ANR - STUDY SCHEMA
-        -----------------------------------------------------------*/
-		    SELECT COUNT (1)
-		      INTO valid_cnt
-		      FROM sdtm_auth_master am
-		     WHERE audit_rec.user_isid = am.auth_isid
-		       AND audit_rec.target_location = UPPER (am.target_location)
-		       AND audit_rec.life_cycle = UPPER (am.life_cycle)
-		       AND am.platform = 'ANR'
-		       AND audit_rec.comp_indication = UPPER (am.comp_indication)
-		       AND audit_rec.protocol_delpkg = UPPER (am.protocol_delpkg)
-               AND audit_rec.masked_blinded = UPPER (am.masked_blinded)
-		       AND audit_rec.study_id = UPPER (am.study_id)
-			   AND audit_rec.study_schema = UPPER (am.study_schema);
-
-		    IF valid_cnt = 0
-		    THEN
-				v_unmatched_values := v_unmatched_values || ', study_schema = '
-                                  || audit_rec.study_schema;
-				v_status := 'REJECTED';
-				RAISE ex_exception;
-		    END IF;
-			
-			
-			-- to verify active
-        /*----------------------------------------------------------
-                ANR - ACTIVE
-        -----------------------------------------------------------*/
-		    SELECT COUNT (1)
-		      INTO valid_cnt
-		      FROM sdtm_auth_master am
-		     WHERE audit_rec.user_isid = am.auth_isid
-		       AND audit_rec.target_location = UPPER (am.target_location)
-		       AND audit_rec.life_cycle = UPPER (am.life_cycle)
-		       AND am.platform = 'ANR'
-		       AND audit_rec.comp_indication = UPPER (am.comp_indication)
-		       AND audit_rec.protocol_delpkg = UPPER (am.protocol_delpkg)
-               AND audit_rec.masked_blinded = UPPER (am.masked_blinded)
-		       AND audit_rec.study_id = UPPER (am.study_id)
-			   AND audit_rec.study_schema = UPPER (am.study_schema) 
-			   AND audit_rec.active = UPPER (am.active);
-
-		    IF valid_cnt = 0
-		    THEN
-				v_unmatched_values := v_unmatched_values || ', active = '
-                                  || audit_rec.active;
-				v_status := 'REJECTED';
-				RAISE ex_exception;
-		    END IF;
-
-
-	    ELSIF v_platform='FIREWALLED' THEN
-		    -- to verify business group
-        /*----------------------------------------------------------
-                FIREWALLED - BUSINESS GROUP
-        -----------------------------------------------------------*/
-		    SELECT COUNT (1)
-		      INTO valid_cnt
-		      FROM sdtm_auth_master am
-		     WHERE audit_rec.user_isid = am.auth_isid
-		       AND audit_rec.platform = am.platform
-		       AND audit_rec.business_group = UPPER (am.business_group);
-
-		    IF valid_cnt = 0
-		    THEN
-           v_status := 'REJECTED';
-           v_unmatched_values := v_unmatched_values || ', business_group = '
-                                || audit_rec.business_group;
-		       RAISE ex_exception;
-		    END IF;
-
-		    -- to verify protocol deliverable
-         /*----------------------------------------------------------
-                FIREWALLED - PROTOCOL DELPKG
-        -----------------------------------------------------------*/
-		    SELECT COUNT (1)
-		      INTO valid_cnt
-		      FROM sdtm_auth_master am
-		     WHERE audit_rec.user_isid = am.auth_isid
-		       AND audit_rec.platform = am.platform
-		       AND audit_rec.business_group = UPPER (am.business_group)
-		       AND audit_rec.protocol_delpkg = UPPER (am.protocol_delpkg);
-
-		    IF valid_cnt = 0
-		    THEN
-           v_status := 'REJECTED';
-           v_unmatched_values := v_unmatched_values || ', PROTOCOL_DELPKG = '
-                                || audit_rec.protocol_delpkg;
-		       RAISE ex_exception;
-		    END IF;
-
-
-        -- to verify LIFE_CYCLE
-        /*----------------------------------------------------------
-                FIREWALLED - LIFE_CYCLE
-        -----------------------------------------------------------*/
-        SELECT COUNT (1)
-          INTO valid_cnt
-          FROM sdtm_auth_master am
-         WHERE audit_rec.user_isid = am.auth_isid
-           --AND audit_rec.target_location = UPPER (am.target_location)
-           AND audit_rec.life_cycle = UPPER (am.life_cycle)
-           AND audit_rec.platform = am.platform
-           AND audit_rec.business_group = UPPER (am.business_group)
-           AND audit_rec.protocol_delpkg = UPPER (am.protocol_delpkg);
-
-        IF valid_cnt = 0
-        THEN
-       
-           v_unmatched_values := v_unmatched_values || ', life_cycle = '
-                                  || audit_rec.life_cycle;
-           v_status := 'REJECTED';
-           RAISE ex_exception;
-        END IF;
-
-        -- to verify Environment
-        /*----------------------------------------------------------
-                FIREWALLED - TARGET LOCATION / ENVIRONMENT
-        -----------------------------------------------------------*/
-        SELECT COUNT (1)
-          INTO valid_cnt
-          FROM sdtm_auth_master am
-         WHERE audit_rec.user_isid = am.auth_isid
-           AND audit_rec.target_location = UPPER (am.target_location)
-           AND audit_rec.life_cycle = UPPER (am.life_cycle)
-           AND audit_rec.platform = am.platform
-           AND audit_rec.business_group = UPPER (am.business_group)
-           AND audit_rec.protocol_delpkg = UPPER (am.protocol_delpkg);
-
-        IF valid_cnt = 0
-        THEN
-           v_unmatched_values := v_unmatched_values || ', env = '
-                                  || audit_rec.target_location;
-           v_status := 'REJECTED';
-           RAISE ex_exception;
-        END IF;
-
-       
-         -- to verify MASKED_BLINDED
-        /*----------------------------------------------------------
-                FIREWALLED - MASKED_BLINDED
-        -----------------------------------------------------------*/
-        SELECT COUNT (1)
-          INTO valid_cnt
-          FROM sdtm_auth_master am
-         WHERE audit_rec.user_isid = am.auth_isid
-           AND audit_rec.target_location = UPPER (am.target_location)
-           AND audit_rec.life_cycle = UPPER (am.life_cycle)
-           AND audit_rec.platform = am.platform
-           AND audit_rec.business_group = UPPER (am.business_group)
-           AND audit_rec.protocol_delpkg = UPPER (am.protocol_delpkg) 
-           AND audit_rec.masked_blinded = UPPER (am.masked_blinded);
-
-        IF valid_cnt = 0
-        THEN
-           v_unmatched_values := v_unmatched_values || ', masked_blinded = '
-                                  || audit_rec.masked_blinded;
-           v_status := 'REJECTED';
-           RAISE ex_exception;
-        END IF;
-		
-		
-    -- to verify study
-        /*----------------------------------------------------------
-                FIREWALLED - STUDY
-        -----------------------------------------------------------*/
-		    SELECT COUNT (1)
-		      INTO valid_cnt
-		      FROM sdtm_auth_master am
-		     WHERE audit_rec.user_isid = am.auth_isid
-		       AND audit_rec.target_location = UPPER (am.target_location)
-		       AND audit_rec.life_cycle = UPPER (am.life_cycle)
-		       AND am.platform = am.platform
-		       AND audit_rec.business_group = UPPER (am.business_group)
-		       AND audit_rec.protocol_delpkg = UPPER (am.protocol_delpkg)
-               AND audit_rec.masked_blinded = UPPER (am.masked_blinded)
-		       AND audit_rec.study_id = UPPER (am.study_id);
-
-		    IF valid_cnt = 0
-		    THEN
-				v_unmatched_values := v_unmatched_values || ', study = '
-                                  || audit_rec.study_id;
-				v_status := 'REJECTED';
-				RAISE ex_exception;
-		    END IF;
-
-
-    -- to verify study schema
-        /*----------------------------------------------------------
-                FIREWALLED - STUDY SCHEMA
-        -----------------------------------------------------------*/
-		    SELECT COUNT (1)
-		      INTO valid_cnt
-		      FROM sdtm_auth_master am
-		     WHERE audit_rec.user_isid = am.auth_isid
-		       AND audit_rec.target_location = UPPER (am.target_location)
-		       AND audit_rec.life_cycle = UPPER (am.life_cycle)
-		       AND am.platform = am.platform
-		       AND audit_rec.business_group = UPPER (am.business_group)
-		       AND audit_rec.protocol_delpkg = UPPER (am.protocol_delpkg)
-               AND audit_rec.masked_blinded = UPPER (am.masked_blinded)
-		       AND audit_rec.study_id = UPPER (am.study_id)
-			   AND audit_rec.study_schema = UPPER (am.study_schema);
-
-		    IF valid_cnt = 0
-		    THEN
-				v_unmatched_values := v_unmatched_values || ', study_schema = '
-                                  || audit_rec.study_schema;
-				v_status := 'REJECTED';
-				RAISE ex_exception;
-		    END IF;
-			
-			
-		-- to verify active
-        /*----------------------------------------------------------
-                FIREWALLED - ACTIVE
-        -----------------------------------------------------------*/
-		    SELECT COUNT (1)
-		      INTO valid_cnt
-		      FROM sdtm_auth_master am
-		     WHERE audit_rec.user_isid = am.auth_isid
-		       AND audit_rec.target_location = UPPER (am.target_location)
-		       AND audit_rec.life_cycle = UPPER (am.life_cycle)
-		       AND am.platform = am.platform
-		       AND audit_rec.business_group = UPPER (am.business_group)
-		       AND audit_rec.protocol_delpkg = UPPER (am.protocol_delpkg)
-               AND audit_rec.masked_blinded = UPPER (am.masked_blinded)
-		       AND audit_rec.study_id = UPPER (am.study_id)
-			   AND audit_rec.study_schema = UPPER (am.study_schema) 
-			   AND audit_rec.active = UPPER (am.active);
-
-		    IF valid_cnt = 0
-		    THEN
-				v_unmatched_values := v_unmatched_values || ', active = '
-                                  || audit_rec.active;
-				v_status := 'REJECTED';
-				RAISE ex_exception;
-		    END IF;
-		
-
-        END IF;
-
-
-        END IF;
-
-
-         error_number := 4;
-
-	
-      EXCEPTION
-         WHEN ex_exception
-         THEN
-            DBMS_OUTPUT.put_line ('error =' || error_number || '  ' || SQLERRM);
-
-            if v_unmatched_values IS NOT NULL 
-            then
-              --Remove Comma
-              v_unmatched_values := substr(v_unmatched_values,2,length(v_unmatched_values));
-              v_status_msg := '<br><br><font color="red">The value of parameters' || upper(v_unmatched_values) || ' does not match what was requested for the CDL-SDTM extraction permissions. Please verify all the parameters in the extraction program must match with the extraction permission and resubmit the job.</font>';
-            else
-              v_unmatched_values := substr(v_unmatched_values,2,length(v_unmatched_values));
-            end if;
-
-            UPDATE sdtm_audit_log al
-               SET status_cd = v_status,
-                   status_msg = v_status_msg,
-                   sas_output_dir = v_sas_output_dir,
-                   end_time = SYSDATE
-             WHERE al.audit_log_seq_no = audit_rec.audit_log_seq_no;
-
-            v_sas_output_dir := NULL;
-      	END;
-END LOOP;
-
-
-   error_number := 5;
-
-   --section for rejecting duplicate values
-   --get all server types for new records
-   FOR audit_rec IN cur_sdtm_audit_log_new ('WAIT')
-   LOOP
-      error_number := 6;
-	IF v_platform is Null THEN
-	      SELECT COUNT (alprogress.audit_log_seq_no)
-		INTO v_dup_count
-		FROM sdtm_audit_log alprogress
-	       WHERE alprogress.status_cd IN ('IN-PROGRESS')
-			AND alprogress.study_id = audit_rec.study_id
-			AND alprogress.study_schema = audit_rec.study_schema
-			AND alprogress.target_location = audit_rec.target_location
-			AND alprogress.life_cycle = audit_rec.life_cycle
-			AND alprogress.comp_indication = audit_rec.comp_indication
-			AND alprogress.protocol_delpkg = audit_rec.protocol_delpkg 
-			AND alprogress.masked_blinded = UPPER (audit_rec.masked_blinded) 
-			AND alprogress.active = UPPER (audit_rec.active);
-	ELSIF v_platform='FIREWALLED' THEN
-	      SELECT COUNT (alprogress.audit_log_seq_no)
-		INTO v_dup_count
-		FROM sdtm_audit_log alprogress
-	       WHERE alprogress.status_cd IN ('IN-PROGRESS')
-			AND alprogress.study_id = audit_rec.study_id
-			AND alprogress.study_schema = audit_rec.study_schema
-			AND alprogress.target_location = audit_rec.target_location
-			AND alprogress.life_cycle = audit_rec.life_cycle
-	        AND alprogress.business_group = audit_rec.business_group
-			AND alprogress.protocol_delpkg = audit_rec.protocol_delpkg 
-			AND alprogress.masked_blinded = UPPER (audit_rec.masked_blinded) 
-			AND alprogress.active = UPPER (audit_rec.active);
-	END IF;
+    try:
+        logging.info("Establishing Oracle Session")
+        #Get databricks connectivity details from YAML
+        user_name = config['oracle_conn']['user_name']
+        password  =  config['oracle_conn']['pwd']
+        host = config['oracle_conn']['jdbc_host']
+        port = config['oracle_conn']['jdbc_port']
+        sid = config['oracle_conn']['jdbc_sid']
+
+        # Setup and connect to Oracle DB
+        connection_string = "oracle+cx_oracle://{}:{}@{}:{}/{}".format(user_name, password, host, port, sid)
+        engine = create_engine(connection_string)
+
+        Session = sessionmaker(bind=engine)
+        session = Session()
+        return session
+
+    except Exception as e:
+        logging.error(f"Exits Python- Error while connecting to Onprem Oracle DB: {e}")
+        raise
+
+
+def fetch_databricks_table_info(conn, catalog_name, schema_name, session, audit_log_sq_no, logfile_path, oracle_server_scp):
+
+    """ Gets list of domain/tables for the study by connecting to Databricks
+        Returns:  Domains/tables list"""
     
-	
-      IF v_dup_count=0 
-      THEN
-         SELECT COUNT (1)
-           INTO v_in_progress_cnt
-           FROM sdtm_audit_log alg
-          WHERE alg.status_cd = 'IN-PROGRESS';
-
-         error_number := 7;
-
-         SELECT max_study_thread_count
-           INTO v_max_count
-           FROM sdtm_server_master sm where ROWNUM = 1;
-
-         error_number := 8;
-
-         IF v_in_progress_cnt<v_max_count
-         THEN
-            UPDATE sdtm_audit_log al
-               SET al.status_cd = 'IN-PROGRESS',
-                   al.start_time = SYSDATE
-             WHERE al.audit_log_seq_no = audit_rec.audit_log_seq_no;
-
-			IF v_platform is Null THEN
-				SELECT SUB_DIR 
-				INTO v_sub_dir 
-				FROM sdtm_auth_master am
-				WHERE audit_rec.user_isid = am.auth_isid
-					AND audit_rec.study_id = UPPER (am.study_id)
-					AND audit_rec.study_schema = UPPER (am.study_schema)
-					AND audit_rec.target_location = UPPER (am.target_location)
-					AND audit_rec.protocol_delpkg = UPPER (am.protocol_delpkg)
-					AND am.platform = 'ANR'
-					AND audit_rec.comp_indication = UPPER (am.comp_indication)
-					AND audit_rec.life_cycle = UPPER (am.life_cycle)
-					AND audit_rec.masked_blinded = UPPER (am.masked_blinded) 
-					AND audit_rec.active = UPPER (am.active) 
-					AND ROWNUM = 1;	    
-			ELSIF v_platform='FIREWALLED' THEN
-				SELECT SUB_DIR 
-				INTO v_sub_dir 
-				FROM sdtm_auth_master am
-				WHERE audit_rec.user_isid = am.auth_isid
-					AND audit_rec.study_id = UPPER (am.study_id)
-					AND audit_rec.study_schema = UPPER (am.study_schema)
-					AND audit_rec.target_location = UPPER (am.target_location)
-					AND audit_rec.protocol_delpkg = UPPER (am.protocol_delpkg)
-					AND audit_rec.platform = am.platform
-					AND audit_rec.business_group = UPPER (am.business_group)
-					AND audit_rec.life_cycle = UPPER (am.life_cycle)
-					AND audit_rec.masked_blinded = UPPER (am.masked_blinded) 
-					AND audit_rec.active = UPPER (am.active) 
-					AND ROWNUM = 1;	    
-			END IF;
-
-            error_number := 9;	
-		
-		SELECT    al.audit_log_seq_no
-                   || '<>'
-                   || SDTM_SERVER_HOSTNAME
-                   || '<>'
-                   || SDTM_HTTP_PATH
-                   || '<>'
-                   || SDTM_TOKEN
-                   || '<>'
-		|| SDTM_REF_CATALOG_NAME
-                   || '<>'
-                   || lower(al.STUDY_ID)
-		|| '<>'
-                   || lower(al.STUDY_SCHEMA)
-                   || '<>'
-		|| upper(al.TARGET_LOCATION)
-                   || '<>'
-		|| NVL(al.COMP_INDICATION,'-')
-                   || '<>'
-		|| upper(al.PROTOCOL_DELPKG)
-                   || '<>'
-		|| NVL(al.BUSINESS_GROUP,'-')
-                   || '<>'
-		|| NVL(al.PLATFORM,'-')
-                   || '<>'
-		|| al.sas_output_dir
-                   || '<>'
-		|| v_sub_dir 
-                   || '<>'
-                   || case when al.MASKED_BLINDED like 'MASKED%' then 'masked' else 'unmasked' end
-		|| '<>'
-		|| v_jdbc_host
-                   || '<>'
-		|| v_jdbc_port
-                   || '<>'
-		|| v_jdbc_sid
-                   || '<>'
-                   || '$db_user_name'
-                   || '<>'
-                   || '$db_password'
-		|| '<>'
-                   || '$ORACLE_SERVER_SCP' 
-              INTO v_call_python
-              FROM sdtm_audit_log al, sdtm_server_master sm
-              where al.audit_log_seq_no = audit_rec.audit_log_seq_no 
-		AND sm.INSTANCE = (case when audit_rec.masked_blinded like 'MASKED%' then 'MASKED' else 'UNMASKED' end) 
-		AND sm.LIFE_CYCLE = audit_rec.life_cycle;
-
-             error_number := 10;
-			 
-             DBMS_OUTPUT.put_line (v_call_python);
-         END IF;
-      END IF;
-   END LOOP;
-
-   COMMIT;
-
-EXCEPTION
-   WHEN ex_general_exception
-   THEN
-      DBMS_OUTPUT.put_line ('error =' || error_number || '  ' || SQLERRM);
-      ROLLBACK;
-   WHEN OTHERS
-   THEN
-      DBMS_OUTPUT.put_line ('error =' || error_number || '  ' || SQLERRM);
-      --DBMS_output.put_line(dbms_utility.FORMAT_ERROR_BACKTRACE);
-      ROLLBACK;
-
-END;
-/
-SPOOL OFF
-EXIT;
-sqlhere
-
-
-ora_err_count=$(grep -c "ORA-*:*" ${tmpcalljava})	#find out if there are any oracle errors 
-
-echo "Function: VALIDATION - ERROR COUNT: $ora_err_count" >> "${error_log}"
-
-if [[ ora_err_count -gt 0 ]]
-then
-        grep "ORA-*:*"  ${tmpcalljava} >> "${error_log}"
-        raise_error "reject"
-fi
-
-#Remove any unwanted lines
-sort ${tmpcalljava} | sed -e "s/ \{1,\}$//" -e '/^$/d' > "${calljava}"
-
-echo "${tmpcalljava}" >> "${error_log}"
-
-#rm -f ${tmpcalljava}
-
-}
-
-
-###########################################################################################################################################
-#  Function: Remove_temporary_files
-#
-#  Logic to remove all temporary files and cleanup before next scheduled script run.
-###########################################################################################################################################
-
-function Remove_temporary_files
-{	echo "Testing101" >> /opt/bardscpi/BARDSCPIDEV/bardscpi/bin/testing.log
-    while read filedetails 2>>"${error_log}"
-        do        
-                file_name=$(echo "${filedetails}"|awk '{print $9}')
-                rm -f "${file_name}"
-        done <"${list_of_files}"
-        
-        rm -f "${list_of_files}"
-        rm -f "${config_file_processed}"
-        rm -f "${auth_master}"  
-        rm -f "${config_file_processed}"
-		rm -f "${insert_script}"
-        rm -f "${InsertScriptLog}"
-        rm -f "${audit_log}"
-        rm -f "${calljava}"
-        rm -f "${files_to_backup}"
-        
-}
-
-
-###########################################################################################################################################
-#  Function: BackupDirectory
-#
-# Logic to backup the existing datasets into a timestamped sub-folder before invoking Python to download newer datasets.
-# We also check for any dataset locks. if locked by user, fail.
-# It also maintains the last 5 backups in the TEST Region. Unlimited Backups in PROD region.
-###########################################################################################################################################
-
-function BackupDirectory
-{
-	seq_no="${1}"
-	output_dir="${2}"
-	locked_datasets=null
-	multiple_file_locked=null
-	file_locked_error_exists="N"
-	files_to_backup="${tmp_output_dir}/sdtm_files_to_backup.tmp"
-        
-		#Create sub directory - if not exists ...
-		#code...
-		
-		# Get list of files in current directory
-        ls -ltr "${output_dir}" |grep ^- >"${files_to_backup}"
-        if [[ $? -eq 0 ]]
-        then                    
-            nooffiles=$(wc -l "${files_to_backup}"|cut -d" " -f1)
-                        if [[ ${nooffiles} -gt 0 ]]   # We have files to backup.                  
-                        then
-                            last_filecreated=$(tail -1 "${files_to_backup}" |awk '{print $9}' ) # Finds the last created file in folder.
-                    
-					        #check if file exists
-                            last_file_wt_dir=$(echo "${output_dir}/${last_filecreated}")
-                            if [[ -f "${last_file_wt_dir}" ]]
-                            then
-                                 file_mod_timestamp=$(${BARDSCPIDIRECTORY}/bin/get_file_modified_timestamp.pl "${last_file_wt_dir}"); #Find the time-stamp associated to that last file.
-                            else
-                                 echo "Cannot find information on previous files. ${last_file_wt_dir}">>"${error_log}"; raise_error "reject";
-                            fi
-                                                                    
-                            sas_directory_name=$(echo ${output_dir} |awk -F'/' '{print $(NF) }' )
-                            
-							#create archive sub-folder with time-stamp
-                            backup_directory="${output_dir}/${sas_directory_name}_${file_mod_timestamp}"
-                            if [[ ! -d "${backup_directory}" ]]
-                            then
-                                mkdir ${backup_directory} 2>>"${error_log}" || { echo "could not create directory ${backup_directory} ">>"${error_log}"; raise_error "reject"; } 
-                                
-								#copy all files in current folder to this archive directory
-                                while read backup_file 
-                                do
-                                    filename=$(echo ${backup_file}|awk '{print $9}')
-									error_msg=$(mv "${output_dir}/${filename}" "${backup_directory}" 2>&1)
-									if [[ -n "$error_msg" ]]
-									then
-										echo "${error_msg}">>"${error_log}"
-									fi
-									
-									if [[ "${error_msg}" == *"mv: cannot move"*"Permission denied"* ]]  ## DO WE HAVE A FILE LOCK - YEP!!
-									then	
-										file_locked_error_exists="Y"
-										echo "The dataset ${filename} is still open from previous extraction">>"${error_log}"
-										if [[ "$locked_datasets" != null ]]
-										then
-											multiple_file_locked="Y"
-											locked_datasets="${locked_datasets}, ${filename}"
-			
-										else
-											locked_datasets="${filename}"	
-											multiple_file_locked="N"
-										fi	
-										
-									fi                                                  
-								done <"${files_to_backup}"
-
-									if [[ "${file_locked_error_exists}" = "Y" ]] 				
-									then
-										while read backup_file
-										do
-										   filename=$(echo ${backup_file}|awk '{print $9}')
-										   mv "${backup_directory}/${filename}" "${output_dir}"
-										done <"${files_to_backup}"
-										
-										rm -f "${files_to_backup}"
-										rmdir "${backup_directory}"
-										
-										updateAuditlogBackupError "${seq_no}" "${locked_datasets}" "${multiple_file_locked}"
-										
-										#echo "could not move backup files as some dataset files are still in open from previous extract.">>"${error_log}"; raise_error "reject"; 
-									fi
-									
-									rm -f "${files_to_backup}"
-						
-                            fi
-
-                        fi
-        
-			fi
-	
-        # FOLDER ARCHIVE - Delete from TEST region if the existing study archives exceed more than 5.
-        # SAS output folder name and temp output directory name are passed as params for the Archive Folder Delete shell script
-
-        ${BARDSCPIDIRECTORY}/bin/ArchiveFolderDeletion.ksh "${output_dir}" "${tmp_output_dir}"
-		
-	if [[ "${file_locked_error_exists}" = "Y" ]] 				
-	then
-		return 2		
-	else
-		return 1
-	fi
-
-}
-
-
-###########################################################################################################################################
-# Function: GetEMAILID
-#
-# Logic to get Email ID associated to user(requester) and update in request file.
-###########################################################################################################################################
-
-function GetEMAILID
-{	
-
-set -x
-
-	REQUEST_EMAIL=""
- 
-	users_isid="${1}"
- 
-	db_user_name1='bardscpi_mod'
-	db_password1=$(getpass ${db_user_name1})
-	connectstring1="${db_user_name1}/${db_password1}@${tns_alias}"
-
-
-col_list_from_tbl="${tmp_output_dir}/getemailaddress.log"
-rm -rf "${col_list_from_tbl}"
-
-sqlplus -s ${db_user_name1}/${db_password1} << sqlhere
-WHENEVER SQLERROR EXIT 5
-WHENEVER OSERROR EXIT 10
-set colsep "|"
-set pagesize 0
-set trimspool on
-set trimout on
-set headsep off
-set linesize 1000
-
-SPOOL ${col_list_from_tbl}
-
- select (ISID||'<>'||EMAIL_ADDRESS||'<>'||'END')
- from
-    (SELECT
-          ISID , EMAIL_ADDRESS
-     FROM
-       CPI_MOD_USER_MASTER where ISID = '${users_isid}'
-        ) KALA ;
-
-SPOOL OFF
-EXIT;
-sqlhere
-
-		cp "${col_list_from_tbl}"  "${col_list_from_tbl}_1"
-		cat "${col_list_from_tbl}" |  grep -v '^$' | grep -v  'rows selected'  > "${tmp_output_dir}/col_list_from_tbl.edited"
-		mv  "${tmp_output_dir}/col_list_from_tbl.edited"  "${col_list_from_tbl}"
-
-        REQUEST_ISID=$(head -1 "${col_list_from_tbl}" |awk -F'<>' '{print $1}')
-        REQUEST_EMAIL=$(head -1 "${col_list_from_tbl}" |awk -F'<>' '{print $2}')
-
-		echo "The EMAIL ID of the requester [ $REQUEST_ISID ] is [ $REQUEST_EMAIL ]" >> "${error_log}"
-
-		rm -rf "${col_list_from_tbl}"
-
-}
-
-
-
-###########################################################################################################################################
-#  Function: updateAuditlogBackupError
-#
-#  Function to update status as "REJECTED" in the AUDIT TABLE  if an error encountered during backup the files from previous extraction.
-#  This confirms that dataset is opened and temporarily locked by some user or process.
-###########################################################################################################################################
-function updateAuditlogBackupError
-{
-sq_no="${1}"
-locked_dataset_files="${2}"
-echo "updateAuditlogBackupError : setting status rejected for - ${sq_no} | ${locked_dataset_files}">>"${error_log}"
-if [[ "${3}" = "Y" ]]
-then
-	msg_add="Extraction cannot complete as the following dataset(s) are open: "
-else
-	msg_add="Extraction cannot complete as the following dataset(s) are open: "
-
-fi
-
-`sqlplus -s ${connectstring} << sqlhere
-set define off
-UPDATE sdtm_audit_log al
-SET status_cd = 'REJECTED',
-status_msg = '<br><br><font color="red" > $msg_add' || UPPER('${locked_dataset_files}') || '</font><br><br>' || 'Please close the datasets and reinitiate the extraction.',
-end_time = SYSDATE 
-WHERE al.audit_log_seq_no = '${sq_no}';
-COMMIT;
-EXIT;
-sqlhere`
-
-}
-
-
-
-###########################################################################################################################################
-#  Function: maskYamlFileContent
-#
-#  Function to mask certain contents in th yaml file.
-###########################################################################################################################################
-function maskYamlFileContent
-{
-file="${1}"
-#Masking the values in study yaml file ...
-echo "Masking the values in study yaml file." >> "${error_log}"
-cd ${tmp_output_dir}/${seq_no}
-#cat ${tmp_output_dir}/${seq_no}/study.yaml
-key_tok="access_token"
-mask_val="**********"
-key_un="user_name"
-key_pw="pwd"
-
-while IFS= read -r line; do
-	if [[ "${line}" == *"${key_tok}"* ]] 
-	then
-		echo "  ${key_tok}: ${mask_val}"
-	elif [[ "${line}" == *"${key_un}"* ]] 
-	then
-		echo "  ${key_un}: ${mask_val}"
-	elif [[ "${line}" == *"${key_pw}"* ]] 
-	then
-		echo "  ${key_pw}: ${mask_val}"
-	else
-		# Print the original line
-		echo "${line}"
-	fi
-done < "${file}" > temp.txt && mv temp.txt "${file}"
-
-}
-
-
-
-#################################
-# MAIN SECTION - START
-#################################
-
-user_request="${user_dir}/user_request/sdtm_request" 
-
-# Check if required directories exist.
-
-if [[ ! -d "${user_dir}" ]]
-then
-                echo "User_request directory ${user_dir} does not exist" >> "${error_log}"
-                raise_error "user_request"
-fi
-
-if [[ ! -d "${user_request}" ]]
-then
-                echo "User_request directory ${user_request} does not exist" >> "${error_log}"
-                raise_error "user_request"
-fi
-
-# Remove_temporary_files 2>/dev/null
-
-
-#############################################################
-### LOOP-1  -- FIND OUT NEW EXTRACTION REQUESTS FROM USERS
-#############################################################
-
-echo "LOOP-1 ++ FIND OUT NEW EXTRACTION REQUESTS FROM USERS" >> "${error_log}"
-
-echo "" > "${list_of_files}" 2>>"${error_log}" 
-
-# Navigate to the user request folder.
-
-cd "${user_request}" 2>>"${error_log}"
-if [[ "$?" -eq 0 ]] 
-then 
-        # Identify all newly submitted user requests and record the user parameter files 
-        
-        ls -ltr *.config 1>"${list_of_files}" 2>>/dev/null  
-        
-		nooffiles=$(wc -l "${list_of_files}"|cut -d" " -f1)
-		
-        if [[ ${nooffiles} -gt 0 ]]
-        then 
-            
-			echo "Start: Prep work on new requests and uploading details into the sdtm_audit_log table with NEW status." >> "${error_log}"
-			
-        	#consolidating individual user parameter files to one  -  Each row is equivalent to one param file
-                while read filedetails 2>>"${error_log}"
-                do        
-                    file_name=$(echo "${filedetails}"|awk '{print $9}')
-                    file_isid=$(echo "${filedetails}"|awk '{print $3}')    
-
-			# Logic to get the requesters email id and then uniq all emails before processing.		
-					GetEMAILID "${file_isid}"	
-					emailvalidlist=`cat $file_name | grep ^EMAIL= | sed -e "s/xxx@merck.com/$REQUEST_EMAIL"/g  -e "s/EMAIL=//g" | tr ',' '\n' | sort | uniq  | paste -sd "," -`
-			        cat $file_name | sed -e "s/^EMAIL=.*/EMAIL=$emailvalidlist/g" > ${file_name}_1.tmp
-					mv ${file_name}_1.tmp $file_name 
-					
-			#get all columns to be compared with auth file
-                    if [[ `cat "${file_name}"` == *"BUSINESS_GROUP="* ]] # REGULAR Ext - FW -- OK CHECK
-					then
-						cat "${file_name}"|cut -d"=" -f2| tr -s '\n' ':' | \
-                        awk -F':'  ' {print $1":"$2":"$3":"$4":"$5":"$6":"$7":"$8":"$9":"$10":"$11":"file_owner } ' q="'" file_owner=${file_isid} >>"${config_file_processed}"
-					
-					else												   # REGULAR Ext - AnR -- OK CHECK
-						cat "${file_name}"|cut -d"=" -f2| tr -s '\n' ':' | \
-                        awk -F':'  ' {print $1":"$2":"$3":"$4":"$5":"$6":"$7":"$8":"$9":"null":"null":"file_owner } ' q="'" file_owner=${file_isid} >>"${config_file_processed}"
-					fi
-                    
-                done <"${list_of_files}"
-
-		echo "TESTING"
-		cat ${config_file_processed}
-				
-        # Create INSERT SQL for audit table based on the consolidated file 
-		CreateInsertScript "sdtm_audit_log" "${fields_audit_log}" "${config_file_processed}" 2>>"${error_log}"
-		
-                #execute inserts need to add use SqlInfoGenerate for this               
-                execute_string=$(echo "@${insert_script}" )
-				
-                SqlInfoGenerate  "${execute_string}" "${InsertScriptLog}" 2>>"${error_log}"
-				
-                #remove user parameter files before proceeding. To avoid duplicate run.
-                while read filedetails 2>>"${error_log}"
-                do        
-                        file_name=$(echo "${filedetails}"|awk '{print $9}')
-                        rm -f "${file_name}"
-						
-                done <"${list_of_files}"
-        
-        fi # for all new requests. we have now uploaded into the audit log table.
-		
-	echo "Complete: Prep work on new requests and uploading details into the sdtm_audit_log table with NEW status." >> "${error_log}"	
-	
-	# Call the Validation function to cross-verify user permissions.
-	echo "Start: Validations of user permissions of new requests." >> "${error_log}"
-	
-      #check for new or waiting requests and process them
-	  validateData 2>>"${error_log}"|| { echo "could not validate data ">>"${error_log}"; raise_error "reject";}
-	  
-	  cat ${calljava} | grep -v 'l_html' | grep -v 'User-Defined Exception' >  ${calljava}_1
-		mv  ${calljava}_1 ${calljava}
-
-   	        
-                echo "Request validation steps : [PASS]" >> "${error_log}"
-		
-		echo "Complete: Validations of user permissions of new requests." >> "${error_log}"	
-
-		echo "Start: Core processing...." >> "${error_log}"		
-        
-        
-        while read exec_java 2>>"${error_log}"
-        do      
-            
-			# Get the details per request#
-                	audit_log_seq_no=$(echo "${exec_java}" |awk -F'<>' '{print $1}' )
-			sdtm_server_hostname=$(echo "${exec_java}" |awk -F'<>' '{print $2}' ) 
-                	sdtm_http_path=$(echo "${exec_java}" |awk -F'<>' '{print $3}' ) 
-                	sdtm_token=$(echo "${exec_java}" |awk -F'<>' '{print $4}' )
-                	catalog_name=$(echo "${exec_java}" |awk -F'<>' '{print $5}' ) 				
-                	sdtm_study=$(echo "${exec_java}" |awk -F'<>' '{print $6}' ) 
-                	sdtm_study_schema=$(echo "${exec_java}" |awk -F'<>' '{print $7}' )
-			region=$(echo "${exec_java}" |awk -F'<>' '{print $8}' )
-			comp_ind=$(echo "${exec_java}" |awk -F'<>' '{print $9}' )
-			prot_delpkg=$(echo "${exec_java}" |awk -F'<>' '{print $10}' )
-			bus_group=$(echo "${exec_java}" |awk -F'<>' '{print $11}' )
-			platform=$(echo "${exec_java}" |awk -F'<>' '{print $12}' )
-                	sas_output_directory=$(echo "${exec_java}" |awk -F'<>' '{print $13}' )
-                	sub_dir=$(echo "${exec_java}" |awk -F'<>' '{print $14}' )
-                	sdtm_masked=$(echo "${exec_java}" |awk -F'<>' '{print $15}' )
-                	jdbc_host=$(echo "${exec_java}" |awk -F'<>' '{print $16}' )
-                	jdbc_port=$(echo "${exec_java}" |awk -F'<>' '{print $17}' )
-                	jdbc_sid=$(echo "${exec_java}" |awk -F'<>' '{print $18}' )
-                	db_username=$(echo "${exec_java}" |awk -F'<>' '{print $19}' ) 	
-                	db_pwd=$(echo "${exec_java}" |awk -F'<>' '{print $20}' )
-			oracle_server=$(echo "${exec_java}" |awk -F'<>' '{print $21}' )
-				
-				run_specific_logger="${BARDSCPIDIRECTORY}/logs/SDTM_ExtractionLog_${audit_log_seq_no}.log"
-				yaml="${tmp_output_dir}/${audit_log_seq_no}/study.yaml"
-				py_log_path="${tmp_output_dir}/${audit_log_seq_no}"
-				
-				echo "Processing for request# [ $audit_log_seq_no ]" >> "${error_log}"
-				echo "Refer run specific log : ${run_specific_logger}" >> "${error_log}"
-				
-				echo "Processing for request# [ $audit_log_seq_no ]" >> "${run_specific_logger}"
-				echo "`date`" >> "${run_specific_logger}"
-			
-			
-			# Create the request folders under temp and text directory
-				mkdir -p ${tmp_output_dir}/${audit_log_seq_no}
-				
-				echo "	Created the tmp folders." >> "${error_log}"
-				echo "	Created the tmp folders." >> "${run_specific_logger}"
-			
-			echo "Additional Validations" >>  "${run_specific_logger}"				
-
-			# Validation-1: Does the study Level3 *-datasourceextract folder exists?
-            if [[ ! -d "${sas_output_directory}" ]]
-            then
-                error_msg=$(echo "sas_output_directory directory ${sas_output_directory} does not exist")
-				echo "   ==> ${sas_output_directory} does not exist "  >> "${error_log}"		
-
-				echo "TARGET FOLDER ACCESS CHECK: [NOT OK]" >>  "${run_specific_logger}"
-				echo "ERROR: The output study folder [${sas_output_directory}] was not accessible to the program service account." >>  "${run_specific_logger}"
-				echo "execution stopped `date`" >>  "${run_specific_logger}"
-				
-				cp "${run_specific_logger}" ${tmp_output_dir}/${audit_log_seq_no}/				
-				/bin/zip -j ${audit_log_seq_no}.zip ${run_specific_logger}
-				/bin/scp -p ${audit_log_seq_no}.zip ${ORACLE_SERVER_SCP}:/opt/bardscpi/mailattachments
-				rm ${audit_log_seq_no}.zip
-				
-
-sqlplus -s ${db_user_name}/${db_password} <<!END
-WHENEVER SQLERROR EXIT 5
-WHENEVER OSERROR EXIT 10
-set colsep "|"
-set pagesize 0
-set trimspool on
-set trimout on
-set headsep off
-set linesize 1000
-
-UPDATE sdtm_audit_log
-set STATUS_CD = 'FAIL' ,
-STATUS_MSG = '<br><br><p><strong>ExtractCDLSDTMDataException</strong>: The destination CPI study -datasourceextract folder was not accessible to the program.</p><li><strong>Error Cause</strong>: The application service account cannot access the CPI study -datasourceextract folder.</li> <li><strong>Next Steps</strong>: Submit a CPI request to report the issue</li>',
-END_TIME = sysdate
-where
-AUDIT_LOG_SEQ_NO = '${audit_log_seq_no}';
-
-commit;
-
-SPOOL OFF
-EXIT;
-!END
-
-			continue
-			fi
-			echo "TARGET FOLDER ACCESS CHECK: [PASS] " >>  "${run_specific_logger}"
-
-			#Fetch study exception paths
-			output_dir="${sas_output_directory}"
-			echo "Fetch extraction study path exceptions." >> "${run_specific_logger}"
-			
-			col_list_from_tbl5="${tmp_output_dir}/openrequests_from_AL.param"
-			rm -rf "${col_list_from_tbl5}"
-
-			if [[ ${platform} = "FIREWALLED" ]]
-			then 
-
-sqlplus -s ${db_user_name}/${db_password} <<!END
-WHENEVER SQLERROR EXIT 5
-WHENEVER OSERROR EXIT 10
-set colsep "|"
-set pagesize 0
-set trimspool on
-set trimout on
-set headsep off
-set linesize 1000
-
-SPOOL ${col_list_from_tbl5}
-
-		select  
-		REGION
-		from 
-			EXTRACTION_STUDY_PATH_EXCEPTION EX
-		where  
-			EX.EXTRACTION_TYPE =  'CDL-SDTM' 
-			AND EX.REGION = '${region}' 
-			AND EX.PROTOCOL_DELPKG = '${prot_delpkg}' 
-			AND EX.BUSINESS_GROUP = '${bus_group}' 
-			AND EX.PLATFORM = '${platform}';
-SPOOL OFF
-EXIT;
-!END
-
-			else
-
-sqlplus -s ${db_user_name}/${db_password} <<!END
-WHENEVER SQLERROR EXIT 5
-WHENEVER OSERROR EXIT 10
-set colsep "|"
-set pagesize 0
-set trimspool on
-set trimout on
-set headsep off
-set linesize 1000
-
-SPOOL ${col_list_from_tbl5}
-
-		select  
-		REGION
-		from 
-			EXTRACTION_STUDY_PATH_EXCEPTION EX
-		where  
-			EX.EXTRACTION_TYPE =  'CDL-SDTM' 
-			AND EX.REGION = '${region}' 
-			AND EX.COMP_INDICATION = '${comp_ind}' 
-			AND EX.PROTOCOL_DELPKG = '${prot_delpkg}';
-
-SPOOL OFF
-EXIT;
-!END
-			
-			fi
-			cp "${col_list_from_tbl5}"  "${col_list_from_tbl5}_1"
-			cat "${col_list_from_tbl5}" |  grep -v '^$' | grep -v  'rows selected'  > "${tmp_output_dir}/col_list_from_tbl5.edited"
-			mv  "${tmp_output_dir}/col_list_from_tbl5.edited"  "${col_list_from_tbl5}"
-
-			has_rows=`cat "${col_list_from_tbl5}_1" |  grep -v '^$' | grep -v  'rows selected'| wc -l`
-			if [[ "${has_rows}" -gt 0 ]]
-			then
-				echo "Matching study path found in extraction_study_path_exception table"  >> "${error_log}"
-				output_dir="${sas_output_directory}"
-			else
-				echo "Matching study path not found in extraction_study_path_exception table"  >> "${error_log}"
-				output_dir="${sas_output_directory}/${sub_dir}"
-
-				# Validation-2: Does the sub-directory /sdtm folder exists?
-				if [[ ! -d "${output_dir}" ]]
-            			then
-					echo "   ==> ${output_dir} does not exist. Create folder ... "  >> "${error_log}"
-					# Create the sub folder under *-datasourceextract directory				
-					mkdir -p ${sas_output_directory}/${sub_dir}
-				fi
-			fi
-			
-
-sqlplus -s ${db_user_name}/${db_password} <<!END
-WHENEVER SQLERROR EXIT 5
-WHENEVER OSERROR EXIT 10
-set colsep "|"
-set pagesize 0
-set trimspool on
-set trimout on
-set headsep off
-set linesize 1000
-
-UPDATE sdtm_audit_log
-set SAS_OUTPUT_DIR = '${output_dir}' 
-where
-AUDIT_LOG_SEQ_NO = '${audit_log_seq_no}';
-
-commit;
-
-SPOOL OFF
-EXIT;
-!END
-
-
-			# Create the request specific YAML file.
-
-				echo "audit_log:" >> ${yaml}
-				echo "  seq_no: $audit_log_seq_no" >> ${yaml}
-                		echo "  study_name: $sdtm_study" >> ${yaml} 
-				echo "  study_schema: $sdtm_study_schema" >> ${yaml}
-				echo "  mask_type: $sdtm_masked" >> ${yaml}
-				echo "  study_path: $output_dir" >> ${yaml}
-				echo "  log_path: $py_log_path" >> ${yaml}
-
-				echo "databricks_conn:" >> ${yaml}
-				echo "  server_hostname: $sdtm_server_hostname" >> ${yaml}
-				echo "  https_path: $sdtm_http_path" >> ${yaml}
-				echo "  access_token: $sdtm_token" >> ${yaml}
-				echo "  catalog_name: $catalog_name" >> ${yaml}
-				
-				echo "oracle_conn:" >> ${yaml}
-				echo "  jdbc_host: $jdbc_host" >> ${yaml}
-				echo "  jdbc_port: $jdbc_port" >> ${yaml}
-				echo "  jdbc_sid: $jdbc_sid" >> ${yaml}
-				echo "  user_name: $db_username" >> ${yaml}
-				echo "  pwd: $db_pwd" >> ${yaml}
-				echo "  oracle_server: $oracle_server" >> ${yaml}
-				echo "	Created the Study YAML file." >> "${error_log}"		
-				echo "	Created the Study YAML file." >> "${run_specific_logger}"	
-			
-			cat ${tmp_output_dir}/${audit_log_seq_no}/study.yaml >>  "${run_specific_logger}"
-
-			## Calling BACKUP function.
-			echo " Invoking Backup function..." >> "${run_specific_logger}"	
-			audit_log_seq_no=$(echo "${exec_java}" |awk -F'<>' '{print $1}' )
-            BackupDirectory "${audit_log_seq_no}"  "${output_dir}"
-	        BKPDIRECTORY_RETURN_CODE=$? 
-			
-			echo " BACKUP FUNCTION STATUS: [$BKPDIRECTORY_RETURN_CODE] " >> "${run_specific_logger}"
-
-            if [ "$BKPDIRECTORY_RETURN_CODE" -eq "1" ]; then # Backup is fine
-                    
-					echo "Invoking Python program..." >> "${run_specific_logger}"
-
-			echo "#####################################"
-			echo "${audit_log_seq_no}"
-			echo "${tmp_output_dir}"
-			echo "####################################"
-					##Python call to INITIATE the extraction
-	                nohup /bin/python3 /opt/bardscpi/BARDSCPIDEV/bardscpi/python_sdtm/sdtm_extraction.py --yamlpath ${yaml} >> "${error_log}" &
-					sleep 60
-					#continue
-					
-					echo " Called the Python extraction for request# ${audit_log_seq_no} ....." >> "${run_specific_logger}"
-					echo " Performance Check: `date` ....." >> "${run_specific_logger}"
-					echo " awaiting response....." >> "${run_specific_logger}"
-					echo " awaiting response....." >> "${run_specific_logger}"
-
-
-            elif [ "$BKPDIRECTORY_RETURN_CODE" -eq "2" ]; then # backup has file locks.
-                    echo " BACKUP was not done due to file locks." >> "${run_specific_logger}"
-
-	    fi
-       
-        done <"${calljava}"
-
-
-
-##########################################################################
-### LOOP-2  -- FIND OUT OPEN EXTRACTION REQUESTS WHERE 
-##             STATUS is IN-PROGRESS and ready for post-processing.
-##########################################################################
-
-
-					echo "Fetch all extraction seq_no with In-Progress status fron sdtm_audit_log table." >> "${error_log}"
-					
-					col_list_from_tbl="${tmp_output_dir}/openrequests_from_AL.param"
-					rm -rf "${col_list_from_tbl}"
-
-sqlplus -s ${db_user_name}/${db_password} <<!END
-WHENEVER SQLERROR EXIT 5
-WHENEVER OSERROR EXIT 10
-set colsep "|"
-set pagesize 0
-set trimspool on
-set trimout on
-set headsep off
-set linesize 1000
-
-SPOOL ${col_list_from_tbl}
-
-		select  
-		AUDIT_LOG_SEQ_NO  
-		from 
-			sdtm_audit_log AL
-		where  
-			AL.STATUS_CD =  'IN-PROGRESS';
-
-SPOOL OFF
-EXIT;
-!END
-
-			cp "${col_list_from_tbl}"  "${col_list_from_tbl}_1"
-			cat "${col_list_from_tbl}" |  grep -v '^$' | grep -v  'rows selected'  > "${tmp_output_dir}/col_list_from_tbl.edited"
-			mv  "${tmp_output_dir}/col_list_from_tbl.edited"  "${col_list_from_tbl}"
-
-			has_rows=`cat "${col_list_from_tbl}_1" |  grep -v '^$' | grep -v  'rows selected'| wc -l`
-			if [[ "${has_rows}" -eq 0 ]]
-			then
-				echo "                        ==> Request count returned from sdtm_audit_log TABLE : ${has_rows} "  >> "${error_log}"
-				echo "                        ==> Better luck in next run.... (:-:) "  >> "${error_log}"
-			else
-				echo "                        ==> Request count returned from sdtm_audit_log TABLE : ${has_rows} "  >> "${error_log}"
-				echo "             2) Check output and process one by one....." >> "${error_log}"
-
-				while read saline 2>>"${error_log}"
-				do
-					seq_no=$(echo "${saline}"|awk -F'<>' '{print $1}')
-					
-					echo "Check for In-Progress extraction status from sdtm_audit_dataset_log table." >> "${error_log}"
-					
-					col_list_from_tbl1="${tmp_output_dir}/openrequests_from_AL.param"
-					rm -rf "${col_list_from_tbl1}"
-					
-sqlplus -s ${db_user_name}/${db_password} <<!END
-WHENEVER SQLERROR EXIT 5
-WHENEVER OSERROR EXIT 10
-set colsep "|"
-set pagesize 0
-set trimspool on
-set trimout on
-set headsep off
-set linesize 1000
-
-SPOOL ${col_list_from_tbl1}
-
-		select  
-		COUNT(1)  
-		from 
-			sdtm_audit_dataset_log EL
-		where  
-			EL.STATUS_CD =  'IN-PROGRESS' 
-			AND EL.AUDIT_LOG_SEQ_NO = '${seq_no}';
-
-SPOOL OFF
-EXIT;
-!END
-
-					cp "${col_list_from_tbl1}"  "${col_list_from_tbl1}_1"
-					cat "${col_list_from_tbl1}" |  grep -v '^$' | grep -v  'rows selected'  > "${tmp_output_dir}/col_list_from_tbl1.edited"
-					mv  "${tmp_output_dir}/col_list_from_tbl1.edited"  "${col_list_from_tbl1}"
-					
-					progress_count=$(head -1 "${col_list_from_tbl1}" |awk -F'<>' '{print $1}')
-					
-					if [[ "${progress_count}" -eq 0 ]]
-					then
-						echo "Check for In-Progress extraction status from sdtm_audit_dataset_log table." >> "${error_log}"
-						
-						col_list_from_tbl2="${tmp_output_dir}/openrequests_from_AL.param"
-						rm -rf "${col_list_from_tbl2}"
-					
-sqlplus -s ${db_user_name}/${db_password} <<!END
-WHENEVER SQLERROR EXIT 5
-WHENEVER OSERROR EXIT 10
-set colsep "|"
-set pagesize 0
-set trimspool on
-set trimout on
-set headsep off
-set linesize 1000
-
-SPOOL ${col_list_from_tbl2}
-
-		select  
-		COUNT(1)  
-		from 
-			sdtm_audit_dataset_log EL
-		where  
-			EL.AUDIT_LOG_SEQ_NO = '${seq_no}';
-
-SPOOL OFF
-EXIT;
-!END
-
-						cp "${col_list_from_tbl2}"  "${col_list_from_tbl2}_1"
-						cat "${col_list_from_tbl2}" |  grep -v '^$' | grep -v  'rows selected'  > "${tmp_output_dir}/col_list_from_tbl2.edited"
-						mv  "${tmp_output_dir}/col_list_from_tbl2.edited"  "${col_list_from_tbl2}"
-					
-						total_count=$(head -1 "${col_list_from_tbl2}" |awk -F'<>' '{print $1}')
-						
-						echo "Check for Success extraction status from sdtm_audit_dataset_log table." >> "${error_log}"
-					
-						col_list_from_tbl3="${tmp_output_dir}/openrequests_from_AL.param"
-						rm -rf "${col_list_from_tbl3}"
-					
-sqlplus -s ${db_user_name}/${db_password} <<!END
-WHENEVER SQLERROR EXIT 5
-WHENEVER OSERROR EXIT 10
-set colsep "|"
-set pagesize 0
-set trimspool on
-set trimout on
-set headsep off
-set linesize 1000
-
-SPOOL ${col_list_from_tbl3}
-
-		select  
-		COUNT(1)  
-		from 
-			sdtm_audit_dataset_log EL
-		where  
-			EL.STATUS_CD =  'COMPLETED' 
-			AND EL.AUDIT_LOG_SEQ_NO = '${seq_no}';
-
-SPOOL OFF
-EXIT;
-!END
-
-						cp "${col_list_from_tbl3}"  "${col_list_from_tbl3}_1"
-						cat "${col_list_from_tbl3}" |  grep -v '^$' | grep -v  'rows selected'  > "${tmp_output_dir}/col_list_from_tbl3.edited"
-						mv  "${tmp_output_dir}/col_list_from_tbl3.edited"  "${col_list_from_tbl3}"
-					
-						success_count=$(head -1 "${col_list_from_tbl3}" |awk -F'<>' '{print $1}')
-						
-						if [[ "${total_count}" -gt 0 && "${total_count}" -eq "${success_count}" ]]
-						then
-							echo " Setting the Overall status of the job to : SUCCESS. " >> "${error_log}"	
-							echo " Completed date: `date` " >> "${error_log}"
-							
-sqlplus -s ${db_user_name}/${db_password} <<!END
-WHENEVER SQLERROR EXIT 5
-WHENEVER OSERROR EXIT 10
-set colsep "|"
-set pagesize 0
-set trimspool on
-set trimout on
-set headsep off
-set linesize 1000
-
-UPDATE sdtm_audit_log
-set STATUS_CD = 'SUCCESS',
-STATUS_MSG = 'CDL-SDTM Data Extraction and SAS Data Conversion for all requested domains is complete.',
-END_TIME = sysdate
-where
-AUDIT_LOG_SEQ_NO = '${seq_no}';
-
-commit;
-
-SPOOL OFF
-EXIT;
-!END
-
-							maskYamlFileContent "${tmp_output_dir}/${seq_no}/study.yaml"
-
-							#Add all csv's into single sanity check report ...
-							echo "Forming the Sanity Report for ${seq_no} ... " >> "${error_log}"
-							fn="."
-							report_name="sanity_report_${seq_no}.csv"
-							cd ${tmp_output_dir}/${seq_no}
-							for fcsv in *.csv; do
-								echo "Processing file - ${fcsv} ..." >> "${error_log}"
-								if [[ "${fn}" == "." ]]
-								then
-									cat "${fcsv}" > "${report_name}"
-									fn=${fcsv}
-								else
-									tail -n +2 "${fcsv}" | cat >> "${report_name}"
-								fi
-								rm "${fcsv}"
-							done
-							echo "Sanity Report completed - ${report_name}" >> "${error_log}"
-
-						else
-							
-							echo "Fetch all extraction seq_no with Failed status fron sdtm_audit_log table." >> "${error_log}"
-					
-							col_list_from_tb4="${tmp_output_dir}/openrequests_from_AL.param"
-							rm -rf "${col_list_from_tb4}"
-
-sqlplus -s ${db_user_name}/${db_password} <<!END
-WHENEVER SQLERROR EXIT 5
-WHENEVER OSERROR EXIT 10
-set colsep "|"
-set pagesize 0
-set trimspool on
-set trimout on
-set headsep off
-set linesize 1000
-
-SPOOL ${col_list_from_tb4}
-
-		select 
-		AUDIT_DATASET_LOG_SEQ_NO||'<>'|| 
-		DATASET_NAME||'<>'|| 
-		STATUS_MSG 
-		from 
-			sdtm_audit_dataset_log EL
-		where  
-			EL.STATUS_CD =  'FAIL' 
-			AND EL.AUDIT_LOG_SEQ_NO = '${seq_no}';
-
-SPOOL OFF
-EXIT;
-!END
-
-							cp "${col_list_from_tb4}"  "${col_list_from_tb4}_1"
-							cat "${col_list_from_tb4}" |  grep -v '^$' | grep -v  'rows selected'  > "${tmp_output_dir}/col_list_from_tb4.edited"
-							mv  "${tmp_output_dir}/col_list_from_tb4.edited"  "${col_list_from_tb4}"
-
-							has_rows=`cat "${col_list_from_tb4}_1" |  grep -v '^$' | grep -v  'rows selected'| wc -l`
-							if [[ "${has_rows}" -gt 0 ]]
-							then
-								echo "                        ==> Request count returned from sdtm_audit_dataset_log TABLE : ${has_rows} "  >> "${error_log}"
-								err_datasets=""
-								log_files=""
-
-								while read saline 2>>"${error_log}"
-								do
-									ds_seq_no=$(echo "${saline}"|awk -F'<>' '{print $1}')
-									dataset=$(echo "${saline}"|awk -F'<>' '{print $2}')
-									err_msg=$(echo "${saline}"|awk -F'<>' '{print $3}')
-									err_datasets+=" ${dataset},"
-									log_files+=" cdl_sdtm_extraction_${seq_no}_${ds_seq_no}_${dataset}_py.log"
-									
-								done  < "${col_list_from_tb4}"      # End for each
-
-							err_datasets=$(sed 's/,$//' <<< "$err_datasets")
-
-							#Add all csv's into single sanity check report ...
-							echo "Forming the Sanity Report for ${seq_no} ... " >> "${error_log}"
-							fn="."
-							report_name="sanity_report_${seq_no}.csv"
-							cd ${tmp_output_dir}/${seq_no}
-							for fcsv in *.csv; do
-								echo "Processing file - ${fcsv} ..." >> "${error_log}"
-								if [[ "${fn}" == "." ]]
-								then
-									cat "${fcsv}" > "${report_name}"
-									fn=${fcsv}
-								else
-									tail -n +2 "${fcsv}" | cat >> "${report_name}"
-								fi
-								rm "${fcsv}"
-							done
-							echo "Sanity Report completed - ${report_name}" >> "${error_log}"
-
-							#create zip file with log files
-							cd ${tmp_output_dir}/${seq_no}
-							/bin/zip -j ${seq_no}.zip ${log_files} ${report_name}
-							/bin/scp -p ${seq_no}.zip ${ORACLE_SERVER_SCP}:/opt/bardscpi/mailattachments
-							#rm ${seq_no}.zip
-
-								
-sqlplus -s ${db_user_name}/${db_password} <<!END
-WHENEVER SQLERROR EXIT 5
-WHENEVER OSERROR EXIT 10
-set colsep "|"
-set pagesize 0
-set trimspool on
-set trimout on
-set headsep off
-set linesize 1000
-
-UPDATE sdtm_audit_log
-set STATUS_CD = 'FAIL',
-STATUS_MSG = '<br><br><strong>Error Cause</strong>: CDL-SDTM Data Extraction / SAS Data Conversion failed for datasets -${err_datasets}.',
-END_TIME = sysdate
-where
-AUDIT_LOG_SEQ_NO = '${seq_no}';
-
-commit;
-
-SPOOL OFF
-EXIT;
-!END
-
-								maskYamlFileContent "${tmp_output_dir}/${seq_no}/study.yaml"
-
-							fi
-							
-						fi
-						
-					fi
-				
-				done < "${col_list_from_tbl}"      # End for each
-			fi
-
-
-# End of Processing        
-
-        Remove_temporary_files 2>/dev/null
-        exit 0
-else
-        echo "Target directory ${BARDSCPIDIRECTORY} does not exist" >>"${error_log}"
-        exit 0
-fi
-
-### END OF PROGRAM ####
+    try:
+        logging.info("Inside fetch_databricks_table_info Method")
+        query = f"SHOW TABLES IN `{catalog_name}`.`{schema_name}`";
+        with conn.cursor() as cursor:
+            cursor.execute(query)
+            tables = cursor.fetchall()
+        all_domains = [tableName for _, tableName, _ in tables]
+
+        logging.info("Available Domains list")
+        logging.info(all_domains)
+
+        exclude_domains = fetch_exclude_domain_list(session, audit_log_sq_no, logfile_path, oracle_server_scp)
+
+        logging.info("Exclude domains list")
+        logging.info(exclude_domains)
+
+        domains = [domain for domain in all_domains if domain not in exclude_domains]
+        return domains
+
+    except Exception as e:
+        logging.error(f"Error while fetching domains from databricks: {e}")
+        zip_and_transfer(audit_log_sq_no, logfile_path, oracle_server_scp)
+        # Updating audit_log table
+        error_msg =  """<br>
+        <strong>ExtractCDLSDTMDataException:</strong> System encountered an error while listing the Domains from CDL Databricks study schema.<br>
+        <strong>Error Cause:</strong> Connectivity error encountered.<br>
+		<strong>Next Steps:</strong> Submit a CPI request to report the issue."""
+        update_audit_log_table(session, 'FAIL', error_msg, audit_log_sq_no)
+        raise
+
+
+def validate_schema_existence(conn, catalog_name, schema_name, session, audit_log_sq_no, logfile_path, oracle_server_scp):
+
+    """ Check if schema exits in catalog
+        Returns:  True -  If schema is present
+                  False - If schema not present """
+
+    try:
+        logging.info("Inside validate_schema_existence Method")
+        query = f"SHOW SCHEMAS IN `{catalog_name}`";
+        with conn.cursor() as cursor:
+            cursor.execute(query)
+            schemas = cursor.fetchall()
+
+        schema_list = [row.databaseName for row in schemas]
+
+        if schema_name in schema_list:
+            return True
+        else:
+            return False
+
+    except Exception as e:
+        logging.error(f"Error while checking the schema presence in databricks: {e}")
+        zip_and_transfer(audit_log_sq_no, logfile_path, oracle_server_scp)
+        # Updating audit_log table
+        error_msg = """<br>
+        <strong>ExtractCDLSDTMDataException:</strong> Error while fetching the schema details from databricks Catalog.<br>
+        <strong>Error Cause:</strong> Connectivity error encountered.<br>
+		<strong>Next Steps:</strong> Submit a CPI request to report the issue."""
+        update_audit_log_table(session, 'FAIL', error_msg, audit_log_sq_no)
+        raise
+
+
+def fetch_query_results(query, connection):
+    """Fetch columns and data from a query result."""
+    try:
+        logging.info("Inside fetch_query_results")
+        with connection.cursor() as cursor:
+            cursor.execute(query)
+            columns = [desc[0] for desc in cursor.description]
+            data = cursor.fetchall()
+            return columns, data
+
+    except Exception as e:
+        logging.error(f"Error while executing databricks query: {e}")
+        raise
+
+
+def fetch_exclude_domain_list(session, audit_log_sq_no, logfile_path, oracle_server_scp):
+    """Fetch the exclude domain from CDL_DOMAIN_EXCEPTION table"""
+    try:
+        logging.info("Inside fetch_exclude_domain_list Method")
+        fetch_query = text(f"select DOMAIN_NAME from BARDSCPI.CDL_DOMAIN_EXCEPTION where EXTRACTION_TYPE='SDTM' and DOMAIN_NAME is not null")
+        result = session.execute(fetch_query).fetchall()
+        if result:
+            values = [item for row in result for item in row[0].split(',')]
+            domains_ex_list = [domain for domain in values]
+        else:
+            domains_ex_list = []
+        return domains_ex_list
+    except Exception as e:
+        logging.error(f"Error while fetching exclude domains from CDL_DOMAIN_EXCEPTION: {e}")
+        zip_and_transfer(audit_log_sq_no, logfile_path, oracle_server_scp)
+        error_msg =  """<br>
+        <strong>ExtractCDLSDTMDataException:</strong> Error while fetching the exclude domain details from CPI database.<br>
+        <strong>Error Cause:</strong> Connectivity error encountered.<br>
+		<strong>Next Steps:</strong> Submit a CPI request to report the issue."""
+        update_audit_log_table(session, 'FAIL', error_msg, audit_log_sq_no)
+        raise
+    
+
+def start_background_task(config, domains, dataset_log_sq_no):
+    """Run background processing independently"""
+
+    try:
+        logging.info("Inside start_background_task Method")
+        config_str = json.dumps(config)
+        dataset_log_sq_no_str = str(dataset_log_sq_no)
+
+        cmd = ["nohup", "python3", "/opt/bardscpi/BARDSCPIDEV/bardscpi/python_sdtm/async_sas_ds_generation.py", config_str, domains, dataset_log_sq_no_str, "&" ]
+        # Execute the command
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    except Exception as e:
+        logging.error(f"Error while running a subprocess: {e}")
+        raise
+
+
+def zip_and_transfer(audit_log_sq_no, logfile_path, oracle_server_scp):
+    """Create a Zip file for the Log file and copy/scp to mail server"""
+    try:
+        zip_file_name = f"{audit_log_sq_no}.zip"
+        zip_command = ['/bin/zip', '-j', zip_file_name, logfile_path]
+        subprocess.run(zip_command, check=True)
+        scp_command = ['/bin/scp', '-p', zip_file_name, f"{oracle_server_scp}:/opt/bardscpi/mailattachments"]
+        subprocess.run(scp_command, check=True)
+
+        if os.path.exists(zip_file_name):
+            logging.info("Zip file created for SCP is deleted successfully")
+            os.remove(zip_file_name)
+
+        logging.info(f"Successfully zipped and transferred {zip_file_name}.")
+
+    #except subprocess.CalledProcessError as e:
+    #logging.error(f"An error occurred while executing a command: {e}")
+
+    except Exception as e:
+        error_msg =  """<br>
+        <strong>ExtractCDLSDTMDataException:</strong> Error while creating a zip and transferring data to mail server.<br>
+        <strong>Error Cause:</strong> Connectivity error encountered.<br>
+		<strong>Next Steps:</strong> Submit a CPI request to report the issue."""
+        update_audit_log_table(session, 'FAIL', error_msg, audit_log_sq_no)
+        logging.error(f"An unexpected error occurred: {e}")
+
+
+
+def main():
+
+    """ Parse command line arguments and execute the SQL query based on the provided configuration file. """
+
+    try:
+        # Creating argument parser object to work with command line arguments
+        parser = argparse.ArgumentParser(description="YAML file path")
+        parser.add_argument("--yamlpath",  help="YAML file path", required=True)
+        args = parser.parse_args()
+        yaml_file_path = args.yamlpath
+
+        if not yaml_file_path.endswith('.yaml'): 
+           sys.exit(1)
+
+        config = load_and_validate_yaml(yaml_file_path)
+
+
+        #fetch details from config
+        audit_log_sq_no =  config['audit_log']['seq_no']
+        sas_output_path =  config['audit_log']['study_path']
+        catalog_name = config['databricks_conn']['catalog_name']
+        schema_name = config['audit_log']['study_schema']
+        study_name = config['audit_log']['study_name']
+        #oracle_server_scp = config['oracle_conn']['oracle_server']
+        oracle_server_scp = "bardscpi@lctcvd1538.merck.com"
+
+        logfile_path = Path(config['audit_log']['log_path']).joinpath(f"cdl_sdtm_extraction_{audit_log_sq_no}_py.log")
+        logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', handlers=[logging.FileHandler(logfile_path)], level=logging.INFO)
+
+        logging.info(f"Starting CDL SDTM Extraction for - {study_name}")
+        session = get_oracle_db_session(config)
+        logging.info("Oracle Onprem DB session established successfully!!")
+
+        conn = establish_databricks_connection(config, session, audit_log_sq_no, logfile_path, oracle_server_scp)
+        logging.info("Databricks Connection is established successfully!!")
+
+        schema_presence = validate_schema_existence(conn, catalog_name, schema_name, session, audit_log_sq_no, logfile_path, oracle_server_scp)
+        if not schema_presence:
+            logging.error("Study Schema is not available in databricks - Exiting!!!")
+            error_message_schema = """<br>
+                             <strong>ExtractCDLSDTMDataException:</strong> The Study Schema is not available in CDL databricks. Further execution aborted.<br>
+                             <strong>Error Cause:</strong> Study schema not found in CDL databricks.<br>
+                             <strong>Next Steps:</strong> Submit a CPI request to report the issue."""
+            zip_and_transfer(audit_log_sq_no, logfile_path, oracle_server_scp)
+            update_audit_log_table(session, 'FAIL', error_message_schema, audit_log_sq_no)
+            return
+        logging.info("Study Schema is available in databricks")
+
+        domains_list = fetch_databricks_table_info(conn, catalog_name, schema_name, session, audit_log_sq_no, logfile_path, oracle_server_scp)
+        logging.info("Number of domains for the given study in databricks schema")
+        logging.info(len(domains_list))
+
+        if not domains_list:
+            logging.error("No tables are available in databricks for the given schema - Exiting!!!")
+            error_message_table = """<br>
+                             <strong>ExtractCDLSDTMDataException:</strong> There are no domains present under the study schema in CDL databricks. Further execution aboretd.<br>
+                             <strong>Error Cause:</strong> There are no tables/domains under the given study schema.<br>
+                             <strong>Next Steps:</strong> Submit a CPI request to report the issue."""
+            zip_and_transfer(audit_log_sq_no, logfile_path, oracle_server_scp)
+            update_audit_log_table(session, 'FAIL', error_message_table, audit_log_sq_no)
+            return
+
+        # domains_list = ['ae', 'dm', 'cm']
+        for domains in domains_list:
+            # Query to get the next value from the sequence
+            logging.info("Inside Loop - Creating Seqnum")
+            sequence_sql = text("SELECT SDTM_AUDIT_DATASET_LOG_SEQ.NEXTVAL FROM DUAL")
+            result = session.execute(sequence_sql)
+            dataset_log_sq_no = result.fetchone()[0]
+
+            insert_sql = text("""INSERT INTO BARDSCPI.SDTM_AUDIT_DATASET_LOG (AUDIT_LOG_SEQ_NO, AUDIT_DATASET_LOG_SEQ_NO, DATASET_NAME, STATUS_CD, START_TIME)VALUES (:audit_log, :audit_dataset_log, :domain, :status, SYSDATE)""")
+            session.execute(insert_sql, {
+                    "audit_log": audit_log_sq_no,
+                    "audit_dataset_log": dataset_log_sq_no,
+                    "domain": domains,
+                    "status": 'IN-PROGRESS'
+                })
+
+            session.commit()
+            logging.info("Domain record is inserted and status was set to InProgress in audit_dataset_log table")
+
+            # Start the background task - for parllel execution
+            start_background_task(config, domains, dataset_log_sq_no)
+
+
+
+    except Exception as e:
+        logging.error(f"Error in extarction of cdl-sdtm dataset {e}")
+        sys.exit(1)
+
+    finally:
+        # Clean up resources
+        if session:
+            session.close()
+            logging.info("Session closed successfully.")
+        if conn:
+            conn.close()
+            logging.info("Connection closed successfully.")
+
+
+if __name__ == '__main__':
+    main()
